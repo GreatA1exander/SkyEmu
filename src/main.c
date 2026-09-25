@@ -1383,11 +1383,36 @@ uint8_t* se_save_state_to_image(se_save_state_t * save_state, uint32_t *width, u
   *height = save_state->screenshot_height*scale;
   return imdata;
 }
+//stbi_write_png opens with "wb", so a write that is cut short destroys the state already there.
+bool se_write_png_atomic(const char* filename, int width, int height, const uint8_t* imdata){
+  //A truncated suffix would alias these onto filename, and the fallback below would then remove
+  //the state this exists to protect.
+  if(strlen(filename)+5>=SB_FILE_PATH_SIZE)return false;
+  char tmp_path[SB_FILE_PATH_SIZE], old_path[SB_FILE_PATH_SIZE];
+  snprintf(tmp_path,SB_FILE_PATH_SIZE,"%s.tmp",filename);
+  snprintf(old_path,SB_FILE_PATH_SIZE,"%s.old",filename);
+  if(!stbi_write_png(tmp_path,width,height,4,imdata,0)){
+    remove(tmp_path);
+    return false;
+  }
+  if(rename(tmp_path,filename)==0)return true;
+  //Windows can't rename onto an existing file. Move the old one aside rather than deleting it, so
+  //a second failure can put it back instead of leaving nothing at all.
+  remove(old_path);
+  bool moved_aside = rename(filename,old_path)==0;
+  if(rename(tmp_path,filename)==0){
+    if(moved_aside)remove(old_path);
+    return true;
+  }
+  if(moved_aside)rename(old_path,filename);
+  remove(tmp_path);
+  return false;
+}
 bool se_save_state_to_disk(se_save_state_t* save_state, const char* filename){
   if(emu_state.rom_loaded==false)return false;
   uint32_t width=0, height=0;
   uint8_t* imdata = se_save_state_to_image(save_state, &width,&height);
-  bool success= stbi_write_png(filename, width,height, 4, imdata, 0);
+  bool success= se_write_png_atomic(filename, width,height, imdata);
   free(imdata);
   se_emscripten_flush_fs();
   return success;
@@ -5411,7 +5436,7 @@ static void se_auto_save_state_write(se_save_state_t* state, const char* path, u
   if(!superseded){
     uint32_t width=0, height=0;
     uint8_t* imdata = se_save_state_to_image(state,&width,&height);
-    if(stbi_write_png(path,width,height,4,imdata,0)){
+    if(se_write_png_atomic(path,width,height,imdata)){
       //A write retired mid flight must leave this to whatever loaded since.
       mutex_lock(se_auto_save_state_mutex);
       if(seq==se_auto_save_state_seq)se_auto_save_state_first_capture_pending = false;
