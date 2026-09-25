@@ -32,6 +32,7 @@
 
 #if defined(EMSCRIPTEN)
 #include <emscripten.h>
+#include <emscripten/html5.h>
 #endif
 
 #include "cloud.h"
@@ -207,7 +208,8 @@ typedef struct{
   uint32_t nds_layout; 
   uint32_t touch_screen_show_button_labels;
   uint32_t show_screen_bezel;
-  uint32_t padding[218];
+  uint32_t auto_save_state_enable;
+  uint32_t padding[217];
 }persistent_settings_t; 
 _Static_assert(sizeof(persistent_settings_t)==1024, "persistent_settings_t must be exactly 1024 bytes");
 #define SE_STATS_GRAPH_DATA 256
@@ -493,6 +495,21 @@ typedef struct {
 #define SE_NUM_SAVE_STATES 4
 #define SE_MAX_SCREENSHOT_SIZE (NDS_LCD_H*NDS_LCD_W*2*4)
 
+#define SE_AUTO_SAVE_STATE_FIRST_CAPTURE_DELAY 60.0
+#define SE_AUTO_SAVE_STATE_INTERVAL 120.0
+#define SE_AUTO_SAVE_STATE_MIN_GAP 5.0
+static double se_auto_save_state_play_start = 0;
+static double se_auto_save_state_last_capture = 0;
+static bool se_auto_save_state_played = false;
+static bool se_auto_save_state_menu_hold = false;
+static bool se_auto_save_state_first_capture_pending = true;
+//The write mutex is held for the duration of a write; the other guards the fields below it.
+static mutex_t se_auto_save_state_mutex = NULL;
+static mutex_t se_auto_save_state_write_mutex = NULL;
+static bool se_auto_save_state_write_in_flight = false;
+//Bumped on every capture; a write that finds its sequence stale skips instead of overwriting.
+static uint64_t se_auto_save_state_seq = 0;
+
 #define SE_THEME_DARK 0
 #define SE_THEME_LIGHT 1
 #define SE_THEME_BLACK 2
@@ -583,6 +600,8 @@ void se_load_rom_overlay(bool visible);
 void se_draw_onscreen_controller(sb_emu_state_t*state, int mode, float win_x, float win_y, float win_w, float win_h, bool preview, bool center);
 static float se_compute_touchscreen_controls_min_dim(float w, float h, bool *portrait);
 void se_reset_save_states();
+static void se_auto_save_state_flush();
+static void se_auto_save_state_flush_leaving(bool background);
 void se_set_new_controller(se_controller_state_t* cont, int index);
 bool se_run_ar_cheat(const uint32_t* buffer, uint32_t size);
 void se_emscripten_flush_fs();
@@ -1166,6 +1185,7 @@ se_core_state_t core;
 se_core_scratch_t scratch;
 se_core_rewind_buffer_t rewind_buffer;
 se_save_state_t save_states[SE_NUM_SAVE_STATES];
+se_save_state_t auto_save_state;
 se_cloud_state_t cloud_state;
 
 bool se_more_rewind_deltas(se_core_rewind_buffer_t* rewind, uint32_t index){
@@ -2439,6 +2459,18 @@ void se_load_rom_from_emu_state(sb_emu_state_t*emu){
   }
 }
 void se_load_rom(const char *filename){
+  //Persist the game being left behind while save_data_base_path still points at it. Blocking,
+  //because a reset reloads the same game and would race its own autosave. Paced, so that Reset
+  //(which comes through here) doesn't stall on a fresh encode every time it is pressed.
+  se_auto_save_state_flush_leaving(false);
+  //The load below changes emu_state.system, which an encode reads. Retire pending captures
+  //first, then wait out one already encoding; draining first would leave a worker free to start
+  //in between and pass the superseded check.
+  mutex_lock(se_auto_save_state_mutex);
+  ++se_auto_save_state_seq;
+  mutex_unlock(se_auto_save_state_mutex);
+  mutex_lock(se_auto_save_state_write_mutex);
+  mutex_unlock(se_auto_save_state_write_mutex);
   se_reset_rewind_buffer(&rewind_buffer);
   se_reset_save_states();
   se_reset_cheats();
@@ -2580,6 +2612,28 @@ void se_load_rom(const char *filename){
       se_load_state_from_disk(save_states+i,save_state_path);
     }
   }
+  {
+    auto_save_state.valid=false;
+    char save_state_path[SB_FILE_PATH_SIZE];
+    snprintf(save_state_path,SB_FILE_PATH_SIZE,"%s.autosave.state.png",emu_state.save_data_base_path);
+    se_load_state_from_disk(&auto_save_state,save_state_path);
+    if(!auto_save_state.valid){
+      const char* base, *file,*ext;
+      sb_breakup_path(emu_state.save_data_base_path,&base,&file,&ext);
+      snprintf(save_state_path,SB_FILE_PATH_SIZE,"%s%s.autosave.state.png",gui_state.paths.save,file);
+      se_load_state_from_disk(&auto_save_state,save_state_path);
+    }
+  }
+  //Hold off automatic captures until the player starts playing, so loading a game never overwrites
+  //the state captured for it last session before they have had a chance to restore it.
+  double now = se_time();
+  se_auto_save_state_play_start = now;
+  se_auto_save_state_last_capture = now;
+  se_auto_save_state_played = false;
+  se_auto_save_state_menu_hold = false;
+  mutex_lock(se_auto_save_state_mutex);
+  se_auto_save_state_first_capture_pending = auto_save_state.valid!=0;
+  mutex_unlock(se_auto_save_state_mutex);
   emu_state.game_checksum = cloud_drive_hash((const char*)emu_state.rom_data,emu_state.rom_size);
   se_sync_cloud_save_states();
   #ifdef ENABLE_RETRO_ACHIEVEMENTS
@@ -3134,6 +3188,7 @@ void se_ra_register(bool clicked, int x, int y, int w, int h){
 }
 void se_reset_save_states(){
   for(int i=0;i<SE_NUM_SAVE_STATES;++i)save_states[i].valid = false;
+  auto_save_state.valid = false;
 }
 
 static void se_draw_debug_menu(){
@@ -4740,6 +4795,17 @@ void se_download_emscripten_save_states()
       break;
     }
   }
+  {
+    char save_state_path[SB_FILE_PATH_SIZE];
+    snprintf(save_state_path,SB_FILE_PATH_SIZE,"%s.autosave.state.png",emu_state.save_data_base_path);
+    if(sb_file_exists(save_state_path)){
+      size_t data_size;
+      uint8_t* data = sb_load_file_data(save_state_path,&data_size);
+      mz_bool status = mz_zip_add_mem_to_archive_file_in_place_v2(archive_filename,"autosave.state.png",data,data_size,NULL,0,MZ_BEST_COMPRESSION,&zip_error);
+      free(data);
+      if(!status)printf("mz_zip_add_mem_to_archive_file_in_place_v2 failed: %s\n",mz_zip_get_error_string(zip_error));
+    }
+  }
   mutex_lock(cloud_state.save_states_mutex);
   for(int i=0;i<SE_NUM_SAVE_STATES;++i){
     if(cloud_state.save_states_busy[i]||cloud_state.save_states[i].valid==false)continue;
@@ -5323,6 +5389,175 @@ static void se_poll_sdl(){
 }
 #endif
 
+//Automatic save states are written where the emulator is about to stop running: the player
+//pausing, a different game loading, and each platform's app-backgrounded notification.
+
+static bool se_auto_save_state_active(){
+  if(!gui_state.settings.auto_save_state_enable)return false;
+  if(!emu_state.rom_loaded)return false;
+  //Save states are unavailable in hardcore mode, so don't write them out either.
+  if(gui_state.settings.hardcore_mode&&gui_state.ra_logged_in)return false;
+  return true;
+}
+static void se_restore_auto_save_state(){
+  if(auto_save_state.valid)se_restore_state(&core,&auto_save_state);
+}
+//Serialized against every other write, and skipped if a newer capture has already been made.
+static void se_auto_save_state_write(se_save_state_t* state, const char* path, uint64_t seq){
+  mutex_lock(se_auto_save_state_write_mutex);
+  mutex_lock(se_auto_save_state_mutex);
+  bool superseded = seq!=se_auto_save_state_seq;
+  mutex_unlock(se_auto_save_state_mutex);
+  if(!superseded){
+    uint32_t width=0, height=0;
+    uint8_t* imdata = se_save_state_to_image(state,&width,&height);
+    if(stbi_write_png(path,width,height,4,imdata,0)){
+      //A write retired mid flight must leave this to whatever loaded since.
+      mutex_lock(se_auto_save_state_mutex);
+      if(seq==se_auto_save_state_seq)se_auto_save_state_first_capture_pending = false;
+      mutex_unlock(se_auto_save_state_mutex);
+    }else printf("Failed to write out auto save state: %s\n",path);
+    free(imdata);
+    se_emscripten_flush_fs();
+  }
+  mutex_unlock(se_auto_save_state_write_mutex);
+}
+#if !defined(EMSCRIPTEN)
+//Encoding is slow (a DS state packs into a 2048x3072 png), so flushes that happen while the
+//emulator keeps running hand it to this worker instead of stalling the game.
+typedef struct{
+  se_save_state_t state;
+  char path[SB_FILE_PATH_SIZE];
+  uint64_t seq;
+}se_auto_save_state_job_t;
+//Only ever one outstanding job, so a fixed buffer rather than a multi megabyte alloc per capture.
+static se_auto_save_state_job_t se_auto_save_state_job;
+static void se_auto_save_state_write_job(void* data){
+  se_auto_save_state_job_t* job = (se_auto_save_state_job_t*)data;
+  se_auto_save_state_write(&job->state,job->path,job->seq);
+  mutex_lock(se_auto_save_state_mutex);
+  se_auto_save_state_write_in_flight = false;
+  mutex_unlock(se_auto_save_state_mutex);
+}
+#endif
+//background=true only when the emulator will keep running; a going away flush has to finish first.
+static void se_auto_save_state_do_flush(bool background){
+  if(!se_auto_save_state_active())return;
+  if(!se_auto_save_state_played)return;
+  //Measured from the start of play and never restarted, so a detour through the menu can't keep
+  //deferring the first overwrite.
+  mutex_lock(se_auto_save_state_mutex);
+  bool first_capture_pending = se_auto_save_state_first_capture_pending;
+  mutex_unlock(se_auto_save_state_mutex);
+  if(first_capture_pending&&
+     se_time()-se_auto_save_state_play_start<SE_AUTO_SAVE_STATE_FIRST_CAPTURE_DELAY)return;
+
+  #if !defined(EMSCRIPTEN)
+  if(background){
+    mutex_lock(se_auto_save_state_mutex);
+    bool busy = se_auto_save_state_write_in_flight;
+    if(!busy)se_auto_save_state_write_in_flight = true;
+    mutex_unlock(se_auto_save_state_mutex);
+    //Another encode is already running. Skip rather than piling up multi megabyte jobs.
+    if(busy)return;
+  }
+  #else
+  //No threads here, so a background write would copy a job only to run it inline anyway.
+  background = false;
+  #endif
+
+  //Only a copy, so it stays on the emulator thread; just the encode and write are handed off.
+  se_capture_state(&core,&auto_save_state);
+  char save_state_path[SB_FILE_PATH_SIZE];
+  snprintf(save_state_path,SB_FILE_PATH_SIZE,"%s.autosave.state.png",emu_state.save_data_base_path);
+  mutex_lock(se_auto_save_state_mutex);
+  uint64_t seq = ++se_auto_save_state_seq;
+  mutex_unlock(se_auto_save_state_mutex);
+  se_auto_save_state_last_capture = se_time();
+
+  #if !defined(EMSCRIPTEN)
+  if(background){
+    se_auto_save_state_job.state = auto_save_state;
+    snprintf(se_auto_save_state_job.path,SB_FILE_PATH_SIZE,"%s",save_state_path);
+    se_auto_save_state_job.seq = seq;
+    thread_run_detached(se_auto_save_state_write_job,&se_auto_save_state_job);
+    return;
+  }
+  #endif
+  //Straight out of the live state; no second copy when the OS is about to reclaim memory.
+  se_auto_save_state_write(&auto_save_state,save_state_path,seq);
+}
+//Blocking flush, for the paths where no further frame will run.
+static void se_auto_save_state_flush(){ se_auto_save_state_do_flush(false); }
+//Ignores the menu hold, since losing a session is worse than overwriting a state the player chose
+//not to restore, but stays paced because these also fire for transient interruptions on mobile.
+static void se_auto_save_state_flush_leaving(bool background){
+  if(se_time()-se_auto_save_state_last_capture<SE_AUTO_SAVE_STATE_MIN_GAP)return;
+  se_auto_save_state_do_flush(background);
+}
+#if defined(SE_PLATFORM_IOS)
+static void se_auto_save_state_flush_leaving_blocking(void){ se_auto_save_state_flush_leaving(false); }
+#endif
+static void se_auto_save_state_flush_while_running(double min_gap){
+  if(se_auto_save_state_menu_hold)return;
+  if(se_time()-se_auto_save_state_last_capture<min_gap)return;
+  se_auto_save_state_do_flush(true);
+}
+//Edge triggered so a resting stick or held button can't clear the menu hold while the player is
+//deciding whether to restore. Emulator hot keys don't count as playing.
+static bool se_auto_save_state_input_pressed(int i){
+  return emu_state.joy.inputs[i]>0.1&&emu_state.prev_frame_joy.inputs[i]<=0.1;
+}
+static bool se_auto_save_state_game_input_started(){
+  for(int i=SE_KEY_A;i<=SE_KEY_PEN_DOWN;++i)if(se_auto_save_state_input_pressed(i))return true;
+  for(int i=SE_KEY_TURBO_A;i<=SE_KEY_TURBO_R;++i)if(se_auto_save_state_input_pressed(i))return true;
+  if(se_auto_save_state_input_pressed(SE_KEY_SOLAR_P))return true;
+  if(se_auto_save_state_input_pressed(SE_KEY_SOLAR_M))return true;
+  return false;
+}
+#if defined(EMSCRIPTEN)
+//sokol maps SAPP_EVENTTYPE_SUSPENDED to WebGL context loss here, and hiding or closing a tab runs
+//neither the event handler nor cleanup(). Best effort: se_emscripten_flush_fs() is asynchronous.
+static bool se_auto_save_state_on_page_hidden(int event_type, const EmscriptenVisibilityChangeEvent* ev, void* user_data){
+  if(ev->hidden)se_auto_save_state_flush_leaving(false);
+  return false;
+}
+#endif
+static void se_update_auto_save_state(){
+  mutex_lock(se_auto_save_state_mutex);
+  bool first_capture_pending = se_auto_save_state_first_capture_pending;
+  mutex_unlock(se_auto_save_state_mutex);
+  //The menu only holds off captures while last session's state is still the one on disk, since
+  //that is the one the player may have opened the menu to restore. Once it has been overwritten
+  //there is nothing left to protect, and holding on would mean a game paused with the menu open
+  //never saves at all.
+  static bool prev_sidebar_open = false;
+  if(gui_state.sidebar_open!=prev_sidebar_open){
+    se_auto_save_state_menu_hold = gui_state.sidebar_open&&first_capture_pending;
+  }
+  prev_sidebar_open = gui_state.sidebar_open;
+  //Tracked even while the feature is inactive, so toggling it can't leave a stale edge behind.
+  static int prev_run_mode = SB_MODE_PAUSE;
+  int run_mode = emu_state.run_mode;
+  //Specifically a running game being paused; the debugger drops out of SB_MODE_STEP into
+  //SB_MODE_PAUSE after every single step.
+  bool paused_now = run_mode==SB_MODE_PAUSE&&prev_run_mode==SB_MODE_RUN;
+  prev_run_mode = run_mode;
+
+  if(!se_auto_save_state_active())return;
+
+  if(se_auto_save_state_game_input_started()){
+    se_auto_save_state_menu_hold = false;
+    if(!se_auto_save_state_played){
+      //From where play starts, not the load, so brushing a control on the way to the menu doesn't
+      //spend the delay before the first capture.
+      se_auto_save_state_played = true;
+      se_auto_save_state_play_start = se_time();
+    }
+  }
+  if(paused_now)se_auto_save_state_flush_while_running(SE_AUTO_SAVE_STATE_MIN_GAP);
+  else if(run_mode==SB_MODE_RUN)se_auto_save_state_flush_while_running(SE_AUTO_SAVE_STATE_INTERVAL);
+}
 void se_update_frame() {
   #ifdef ENABLE_HTTP_CONTROL_SERVER
   hcs_update(gui_state.settings.http_control_server_enable,gui_state.settings.http_control_server_port,se_hcs_callback);
@@ -5347,6 +5582,7 @@ void se_update_frame() {
       se_emscripten_flush_fs();
     }
   }
+  se_update_auto_save_state();
 
   emu_state.screen_ghosting_strength = gui_state.settings.ghosting;
   const int frames_per_rewind_state = 8; 
@@ -5975,6 +6211,70 @@ void se_draw_menu_panel(){
       }
     }else{
       se_draw_save_states(false);
+    }
+    bool auto_save_state_enable = gui_state.settings.auto_save_state_enable;
+    se_checkbox("Auto Save State",&auto_save_state_enable);
+    gui_state.settings.auto_save_state_enable = auto_save_state_enable;
+    se_tooltip("Save the game automatically when you pause, switch games,\n"
+               "or leave SkyEmu, so little is lost if it closes unexpectedly.");
+    #if defined(EMSCRIPTEN)
+    //On screen rather than a tooltip because tooltips don't survive touch.
+    if(auto_save_state_enable&&emu_state.system==SYSTEM_NDS){
+      igPushStyleColorU32(ImGuiCol_Text,0xff0000ff);
+      se_text(ICON_FK_EXCLAMATION_TRIANGLE " Not recommended for NDS.");
+      se_text("Capturing a DS save state briefly pauses emulation.");
+      igPopStyleColor(1);
+    }
+    #endif
+    if(auto_save_state_enable){
+      if(!emu_state.rom_loaded)se_push_disabled();
+      int card_w = (win_w-style->FramePadding.x)*0.5;
+      int card_h = 64;
+      igBeginChildFrame(200,(ImVec2){card_w,card_h},ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoScrollWithMouse);
+      ImVec2 screen_p;
+      igGetCursorScreenPos(&screen_p);
+      int screen_x = screen_p.x, screen_y = screen_p.y;
+      int screen_w = 64, screen_h = 64+style->FramePadding.y*2;
+      int button_w = 55;
+      igSetCursorPosY(igGetCursorPosY()+1.0);
+      se_text("Auto Save");
+      igSetCursorPosY(igGetCursorPosY()-2.0);
+      if(!auto_save_state.valid)se_push_disabled();
+      if(se_button("Restore",(ImVec2){button_w,0}))se_restore_auto_save_state();
+      if(!auto_save_state.valid)se_pop_disabled();
+      if(auto_save_state.valid){
+        float w_scale = 1.0, h_scale = 1.0;
+        float border_screen_x = screen_x+button_w+(card_w-screen_w-button_w)*0.5;
+        float border_screen_y = screen_y+(card_h-screen_h)*0.5-style->FramePadding.y;
+        ImU32 color = igColorConvertFloat4ToU32(style->Colors[ImGuiCol_MenuBarBg]);
+        ImDrawList_AddRectFilled(igGetWindowDrawList(),(ImVec2){border_screen_x-2,border_screen_y},(ImVec2){border_screen_x+screen_w+2,border_screen_y+screen_h},color,0,ImDrawCornerFlags_None);
+        if(auto_save_state.screenshot_width>auto_save_state.screenshot_height){
+          h_scale = (float)auto_save_state.screenshot_height/(float)auto_save_state.screenshot_width;
+        }else{
+          w_scale = (float)auto_save_state.screenshot_width/(float)auto_save_state.screenshot_height;
+        }
+        screen_w*=w_scale;
+        screen_h*=h_scale;
+        screen_x+=button_w+(card_w-screen_w-button_w)*0.5;
+        screen_y+=(card_h-screen_h)*0.5-style->FramePadding.y;
+        se_draw_image(auto_save_state.screenshot,auto_save_state.screenshot_width,auto_save_state.screenshot_height,
+                      screen_x*se_dpi_scale(),screen_y*se_dpi_scale(),screen_w*se_dpi_scale(),screen_h*se_dpi_scale(), true);
+        if(auto_save_state.valid==2){
+          igSetCursorScreenPos((ImVec2){screen_x+screen_w*0.5-15,screen_y+screen_h*0.5-15});
+          se_button(ICON_FK_EXCLAMATION_TRIANGLE,(ImVec2){30,30});
+          se_tooltip("This save state came from an incompatible build. SkyEmu has attempted to recover it, but there may be issues");
+        }
+      }else{
+        screen_h*=0.85;
+        screen_x+=button_w+(card_w-screen_w-button_w)*0.5;
+        screen_y+=(card_h-screen_h)*0.5-style->FramePadding.y;
+        ImU32 color = igColorConvertFloat4ToU32(style->Colors[ImGuiCol_MenuBarBg]);
+        ImDrawList_AddRectFilled(igGetWindowDrawList(),(ImVec2){screen_x,screen_y},(ImVec2){screen_x+screen_w,screen_y+screen_h},color,0,ImDrawCornerFlags_None);
+        igSetCursorScreenPos((ImVec2){screen_x+screen_w*0.5-5,screen_y+screen_h*0.5-5});
+        se_text(ICON_FK_BAN);
+      }
+      igEndChildFrame();
+      if(!emu_state.rom_loaded)se_pop_disabled();
     }
   }
   se_section(ICON_FK_CLOUD " Google Drive");
@@ -7550,7 +7850,7 @@ void se_load_settings(){
     char settings_path[SB_FILE_PATH_SIZE];
     snprintf(settings_path,SB_FILE_PATH_SIZE,"%suser_settings.bin",se_get_pref_path());
     if(!sb_load_file_data_into_buffer(settings_path,(void*)&gui_state.settings,sizeof(gui_state.settings))){gui_state.settings.settings_file_version=-1;}
-    int max_settings_version_supported =3;
+    int max_settings_version_supported =4;
     if(gui_state.settings.settings_file_version>max_settings_version_supported){
       gui_state.settings.volume=0.8;
       gui_state.settings.draw_debug_menu = false; 
@@ -7598,6 +7898,10 @@ void se_load_settings(){
       https_set_cache_enabled(gui_state.settings.enable_download_cache);
       gui_state.settings.nds_layout = 0; 
       gui_state.settings.touch_screen_show_button_labels= true;
+    }
+    if(gui_state.settings.settings_file_version<4){
+      gui_state.settings.settings_file_version = 4;
+      gui_state.settings.auto_save_state_enable = false;
     }
     if(gui_state.settings.gui_scale_factor<0.5)gui_state.settings.gui_scale_factor=1.0;
     if(gui_state.settings.gui_scale_factor>4.0)gui_state.settings.gui_scale_factor=1.0;
@@ -8645,6 +8949,16 @@ static bool se_reload_theme(){
 static void se_init(){
   printf("SkyEmu %s\n",GIT_COMMIT_HASH);
   stm_setup();
+  se_auto_save_state_mutex = mutex_create();
+  se_auto_save_state_write_mutex = mutex_create();
+  #if defined(EMSCRIPTEN)
+  emscripten_set_visibilitychange_callback(NULL,false,se_auto_save_state_on_page_hidden);
+  #endif
+  #if defined(SE_PLATFORM_IOS)
+  //didEnterBackground, not willResignActive: the latter also fires for Control Center and the
+  //notification shade.
+  se_ios_register_background_handler(se_auto_save_state_flush_leaving_blocking);
+  #endif
   se_load_settings();
   se_reset_cheats();
   gui_state.editing_cheat_index = -1;
@@ -8744,6 +9058,11 @@ static void init(void) {
   #endif
 }
 static void cleanup(void) {
+  se_auto_save_state_flush();
+  //A flush that bailed early can still leave a worker encoding; let it finish before the process
+  //goes away underneath it.
+  mutex_lock(se_auto_save_state_write_mutex);
+  mutex_unlock(se_auto_save_state_write_mutex);
   simgui_shutdown();
   se_free_all_images();
 #ifdef ENABLE_RETRO_ACHIEVEMENTS
@@ -8819,6 +9138,13 @@ static void event(const sapp_event* ev) {
     int b = ev->mouse_button;
     if(b<3)gui_state.mouse_button[0] = ev->type==SAPP_EVENTTYPE_MOUSE_DOWN;
   }
+#if defined(SE_PLATFORM_ANDROID)
+  //onPause arrives on the activity's UI thread; sokol re-dispatches it onto the loop thread as
+  //this event, which can touch emulator state. Best effort: the activity doesn't wait for it.
+  else if(ev->type==SAPP_EVENTTYPE_SUSPENDED){
+    se_auto_save_state_flush_leaving(true);
+  }
+#endif
 }
 bool se_run_ar_cheat(const uint32_t* buffer, uint32_t size){
   // AR Cheats are not allowed to be ran in Hardcore mode

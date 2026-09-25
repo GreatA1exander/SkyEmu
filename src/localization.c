@@ -30,6 +30,13 @@
 // - "Never Overlap Screen"
 // - "Button Labels"
 // - "Show Screen Bezel"
+// - "Auto Save State"
+// - "Save the game automatically when you pause, switch games,\nor leave SkyEmu, so little is lost if it closes unexpectedly."
+//   (the \n line break is part of the string; keep it when translating)
+// - "Auto Save"
+// Web build only:
+// - ICON_FK_EXCLAMATION_TRIANGLE " Not recommended for NDS."
+// - "Capturing a DS save state briefly pauses emulation."
 
 // Strings removed in v4:
 // - "Controller"

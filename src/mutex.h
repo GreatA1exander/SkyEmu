@@ -7,4 +7,6 @@ void mutex_destroy(mutex_t mutex);
 void mutex_lock(mutex_t mutex);
 void mutex_unlock(mutex_t mutex);
 
+void thread_run_detached(void (*fn)(void*), void* arg);
+
 #endif

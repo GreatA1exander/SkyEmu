@@ -2,6 +2,7 @@
 #include "sokol_app.h"
 #include <stdio.h>
 #import <UIKit/UIKit.h>
+#include <stdatomic.h>
 #import <WebKit/WebKit.h>
 #import <SafariServices/SafariServices.h> // added for secure browser support
 
@@ -58,6 +59,38 @@ extern void se_file_browser_accept(const char *filename);
 @end
 #import <UIKit/UIViewController.h>
 #import <objc/runtime.h>
+
+static void (*se_ios_background_handler)(void) = NULL;
+@interface SEBackgroundObserver : NSObject
+@end
+@implementation SEBackgroundObserver
+- (void)appDidEnterBackground:(NSNotification*)note {
+    if(se_ios_background_handler == NULL) return;
+    // The handler can take longer than the time iOS grants unprompted.
+    UIApplication* app = [UIApplication sharedApplication];
+    // The expiration handler can run on another queue, so claim the identifier with an atomic
+    // exchange; whoever takes it ends it, and the other side sees Invalid and does nothing.
+    __block _Atomic(UIBackgroundTaskIdentifier) task = UIBackgroundTaskInvalid;
+    atomic_store(&task, [app beginBackgroundTaskWithName:@"SkyEmuAutoSaveState" expirationHandler:^{
+        UIBackgroundTaskIdentifier claimed = atomic_exchange(&task, UIBackgroundTaskInvalid);
+        if(claimed != UIBackgroundTaskInvalid)[app endBackgroundTask:claimed];
+    }]);
+    se_ios_background_handler();
+    UIBackgroundTaskIdentifier claimed = atomic_exchange(&task, UIBackgroundTaskInvalid);
+    if(claimed != UIBackgroundTaskInvalid)[app endBackgroundTask:claimed];
+}
+@end
+static SEBackgroundObserver* se_ios_background_observer = nil;
+void se_ios_register_background_handler(void (*handler)(void)){
+    se_ios_background_handler = handler;
+    if(se_ios_background_observer == nil){
+        se_ios_background_observer = [SEBackgroundObserver new];
+        [[NSNotificationCenter defaultCenter] addObserver:se_ios_background_observer
+                                                selector:@selector(appDidEnterBackground:)
+                                                    name:UIApplicationDidEnterBackgroundNotification
+                                                  object:nil];
+    }
+}
 
 @implementation UIViewController (Swizzling)
 
